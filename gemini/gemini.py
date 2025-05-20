@@ -1,5 +1,7 @@
-import streamlit as st
-import time
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import mysql.connector
+from mysql.connector import Error
 import os
 import docx
 from PyPDF2 import PdfReader
@@ -13,30 +15,37 @@ from google.api_core.exceptions import ResourceExhausted
 import extract_msg
 from bs4 import BeautifulSoup
 import json
-import mysql.connector
-from mysql.connector import Error
-import pandas as pd
+import time
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
+logger.info("Loading environment variables from .env file...")
 load_dotenv()
 
 # Set Tesseract path for Windows
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
-
-# Initialize session state
-if 'total_tokens' not in st.session_state:
-    st.session_state.total_tokens = 0
-if 'table_data' not in st.session_state:
-    st.session_state.table_data = None
-
-def count_tokens(text):
-    return len(text) // 4 + 1 if text else 0
 
 # MySQL Database Configuration
 MYSQL_HOST = os.getenv("MYSQL_HOST", "localhost")
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "Siyara@191988")
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "geminidocument")
+
+# Initialize FastAPI
+app = FastAPI()
+
+# Enable CORS to allow React frontend to communicate with backend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Initialize MySQL connection
 def init_db():
@@ -49,7 +58,6 @@ def init_db():
         )
         if connection.is_connected():
             cursor = connection.cursor()
-            # Create table with auto-incrementing ID
             create_table_query = """
             CREATE TABLE IF NOT EXISTS extracted_data (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -66,16 +74,15 @@ def init_db():
             connection.commit()
             return connection, cursor
     except Error as e:
-        st.error(f"❌ Database connection failed: {e}")
+        logger.error(f"Database connection failed: {e}")
         return None, None
 
 # Load Gemini API Key
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+logger.info(f"GEMINI_API_KEY found: {'Yes' if GEMINI_API_KEY else 'No'}")
 if not GEMINI_API_KEY:
-    st.warning("GEMINI_API_KEY not found in .env")
-    GEMINI_API_KEY = st.text_input("Enter your Gemini API key:", type="password")
-    if not GEMINI_API_KEY:
-        st.stop()
+    logger.error("GEMINI_API_KEY not found in .env file. Please add it to the .env file.")
+    raise HTTPException(status_code=500, detail="GEMINI_API_KEY not found in .env file.")
 genai.configure(api_key=GEMINI_API_KEY)
 
 # Configure Gemini model
@@ -89,34 +96,26 @@ model = genai.GenerativeModel(
     }
 )
 
-# Read and extract content
-def read_file(uploaded_file):
-    filename = uploaded_file.name.lower()
+def count_tokens(text):
+    return len(text) // 4 + 1 if text else 0
+
+def read_file(file: UploadFile):
+    filename = file.filename.lower()
     all_content = []
     try:
+        content = file.file.read()
+        file.file.seek(0)
         if filename.endswith(".msg"):
-            file_bytes = io.BytesIO(uploaded_file.read())
-            msg = extract_msg.Message(file_bytes)
-            subject = msg.subject or "[No Subject]"
-            st.write(f"📧 Email Subject: {subject}")
-            html_text, plain_text = "", ""
-
+            msg = extract_msg.Message(io.BytesIO(content))
             if msg.htmlBody:
                 soup = BeautifulSoup(msg.htmlBody, 'html.parser')
-                html_text = soup.get_text(separator=' ', strip=True)
-                all_content.append(html_text)
-                st.write(f"📨 Email Body (HTML): {html_text[:300]}...")
+                all_content.append(soup.get_text(separator=' ', strip=True))
             elif msg.body:
-                plain_text = msg.body
-                all_content.append(plain_text)
-                st.write(f"📨 Email Body: {plain_text[:300]}...")
-
+                all_content.append(msg.body)
             if msg.attachments:
-                st.write("📎 Attachments:")
                 for att in msg.attachments:
                     fname = re.sub(r'[^\w\.\-]', '', att.longFilename or att.shortFilename or "Unnamed")
                     att_content = io.BytesIO(att.data)
-                    st.write(f"- {fname}")
                     if fname.endswith(".pdf"):
                         reader = PdfReader(att_content)
                         content = "\n".join(page.extract_text() for page in reader.pages if page.extract_text())
@@ -133,30 +132,26 @@ def read_file(uploaded_file):
                         content = pytesseract.image_to_string(image, lang='eng')
                         if content.strip():
                             all_content.append(content)
-                    else:
-                        st.warning(f"⚠ Unsupported attachment type: {fname}")
             return "\n".join(all_content)[:50000]
         elif filename.endswith(".txt"):
-            return uploaded_file.read().decode("utf-8")[:50000]
+            return content.decode("utf-8")[:50000]
         elif filename.endswith(".pdf"):
-            reader = PdfReader(uploaded_file)
+            reader = PdfReader(io.BytesIO(content))
             return "\n".join(page.extract_text() for page in reader.pages if page.extract_text())[:50000]
         elif filename.endswith(".docx"):
-            doc = docx.Document(uploaded_file)
+            doc = docx.Document(io.BytesIO(content))
             return "\n".join(p.text for p in doc.paragraphs)[:50000]
         elif filename.endswith((".jpg", ".jpeg", ".png")):
-            image = Image.open(uploaded_file)
+            image = Image.open(io.BytesIO(content))
             image = ImageEnhance.Contrast(image).enhance(2.0)
             content = pytesseract.image_to_string(image, lang='eng')
             return content[:50000] if content.strip() else ""
         else:
-            st.error(f"❌ Unsupported file type: {filename}")
-            return ""
+            raise HTTPException(status_code=400, detail=f"Unsupported file type: {filename}")
     except Exception as e:
-        st.error(f"❌ Error processing file: {e}")
-        return ""
+        logger.error(f"Error processing file {filename}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
-# Gemini Extraction
 def extract_data_with_gemini(content, retries=3, delay=10):
     if not content:
         return None, 0, 0
@@ -190,42 +185,36 @@ Text: {content}
             result = response.text.strip()
             result = re.sub(r'^json\n?|```json|```', '', result, flags=re.MULTILINE).strip()
             output_tokens = count_tokens(result)
-            st.session_state.total_tokens += input_tokens + output_tokens
             return result, input_tokens, output_tokens
         except ResourceExhausted:
             if attempt < retries - 1:
-                st.warning("⏳ Rate limit hit. Retrying...")
                 time.sleep(delay)
                 delay *= 2
             else:
-                st.error("❌ Gemini API quota exhausted.")
-                return None, input_tokens, 0
+                logger.error("Gemini API quota exhausted")
+                raise HTTPException(status_code=429, detail="Gemini API quota exhausted")
         except Exception as e:
-            st.error(f"❌ Gemini error: {e}")
-            return None, input_tokens, 0
+            logger.error(f"Gemini error: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Gemini error: {str(e)}")
 
-# Detect email intent
 def detect_email_intent(content):
     prompt = (
         "Read the email content below and identify the main intent or purpose in one line.\n"
         "Examples: Invitation for interview, Rejection letter, Offer letter, Request for documents, Acknowledgement, General update\n\n"
-        f"Email Content:\n\"\"\"\n{content}\n\"\"\"\n\nRespond with only the intent."
+        f"Email Content:\n\"\"\"\n{content}\n\"\"\"\n\nRespond with only the intent"
     )
     try:
         response = model.generate_content(prompt)
         return response.text.strip()
     except Exception as e:
-        st.warning(f"⚠ Intent detection failed: {e}")
+        logger.warning(f"Intent detection failed: {str(e)}")
         return "Unknown"
 
-# Convert list values to strings
 def convert_lists_to_strings(record):
     return {k: ", ".join(v) if isinstance(v, list) else str(v) for k, v in record.items()}
 
-# Check for duplicate data
 def is_duplicate(record, connection, cursor):
     try:
-        # Convert lists to strings
         record = convert_lists_to_strings(record)
         query = """
         SELECT COUNT(*) FROM extracted_data 
@@ -237,22 +226,19 @@ def is_duplicate(record, connection, cursor):
             record.get("number", "")
         )
         cursor.execute(query, values)
-        count = cursor.fetchone()[0]
-        return count > 0
+        return cursor.fetchone()[0] > 0
     except Exception as e:
-        st.warning(f"⚠ Error checking duplicates: {e}")
+        logger.warning(f"Error checking duplicates: {str(e)}")
         return False
 
-# Store data in MySQL
 def store_data_in_db(data, connection, cursor):
     try:
         parsed = json.loads(data)
         inserted = False
         for record in parsed:
-            # Convert lists to strings
             record = convert_lists_to_strings(record)
             if is_duplicate(record, connection, cursor):
-                st.info(f"ℹ Skipped storing duplicate record for {record.get('name', 'Unknown')}")
+                logger.info(f"Skipped storing duplicate record for {record.get('name', 'Unknown')}")
                 continue
             insert_query = """
             INSERT INTO extracted_data (name, email, number, professional_summary, project_name, skills)
@@ -272,22 +258,20 @@ def store_data_in_db(data, connection, cursor):
             connection.commit()
         return inserted
     except json.JSONDecodeError:
-        st.error("❌ Failed to parse JSON. Data not stored.")
-        return False
+        logger.error("Failed to parse JSON")
+        raise HTTPException(status_code=400, detail="Failed to parse JSON")
     except Exception as e:
-        st.error(f"❌ Database storage error: {e}")
-        return False
+        logger.error(f"Database storage error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database storage error: {str(e)}")
 
-# Fetch IDs from database
 def fetch_ids(connection, cursor):
     try:
         cursor.execute("SELECT id FROM extracted_data")
         return [str(row[0]) for row in cursor.fetchall()]
     except Exception as e:
-        st.error(f"❌ Error fetching IDs: {e}")
-        return []
+        logger.error(f"Error fetching IDs: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error fetching IDs")
 
-# Fetch record by ID
 def fetch_record_by_id(record_id, connection, cursor):
     try:
         query = """
@@ -298,108 +282,117 @@ def fetch_record_by_id(record_id, connection, cursor):
         result = cursor.fetchone()
         if result:
             return {
-                "Name": result[0] or "N/A",
-                "Email": result[1] or "N/A",
-                "Number": result[2] or "N/A",
-                "Professional Summary": result[3] or "N/A",
-                "Project Name": result[4] or "N/A",
-                "Skills": result[5] or "N/A"
+                "name": result[0] or "N/A",
+                "email": result[1] or "N/A",
+                "number": result[2] or "N/A",
+                "professional_summary": result[3] or "N/A",
+                "project_name": result[4] or "N/A",
+                "skills": result[5] or "N/A"
             }
         return None
     except Exception as e:
-        st.error(f"❌ Error fetching record: {e}")
-        return None
+        logger.error(f"Error fetching record: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error fetching record")
 
-# UI Layout
-st.title("📄 Gemini Document Extractor")
-st.write("Upload files to extract and store details, or view stored records.")
+def fetch_all_records(connection, cursor):
+    try:
+        query = """
+        SELECT id, name, email, number, professional_summary, project_name, skills
+        FROM extracted_data
+        """
+        cursor.execute(query)
+        results = cursor.fetchall()
+        records = []
+        for result in results:
+            records.append({
+                "id": str(result[0]),
+                "name": result[1] or "N/A",
+                "email": result[2] or "N/A",
+                "number": result[3] or "N/A",
+                "professional_summary": result[4] or "N/A",
+                "project_name": result[5] or "N/A",
+                "skills": result[6] or "N/A"
+            })
+        return records
+    except Exception as e:
+        logger.error(f"Error fetching all records: {str(e)}")
+        raise HTTPException(status_code=500, detail="Error fetching all records")
 
-# Initialize database
-connection, cursor = init_db()
-if not connection or not cursor:
-    st.stop()
-
-# Tabs for Upload and View
-tab1, tab2 = st.tabs(["📤 Upload Documents", "📋 View Records"])
-
-with tab1:
-    uploaded_files = st.file_uploader(
-        "Upload your documents:",
-        type=["msg", "txt", "pdf", "docx", "jpg", "png", "jpeg"],
-        accept_multiple_files=True
-    )
-
-    if uploaded_files:
-        for i, file in enumerate(uploaded_files):
-            if st.button(f"Process {file.name}", key=f"btn_{i}"):
-                st.write(f"📂 Reading `{file.name}`...")
-                file.seek(0)
-                content = read_file(file)
-
-                # Email Intent
-                st.markdown("### 🤠 Email Intent")
-                intent = detect_email_intent(content)
-                st.write(f"🔍 Intent: **{intent}**")
-
-                # Extract data
-                st.markdown("### ✨ Extracting with Gemini")
-                result, in_tokens, out_tokens = extract_data_with_gemini(content)
-                if result:
-                    try:
-                        parsed = json.loads(result)
-                        st.success("✅ Data extracted successfully!")
-                        # Store in database
-                        if store_data_in_db(result, connection, cursor):
-                            st.success("✅ Data stored in database successfully!")
-                        else:
-                            st.info("ℹ No new data stored (possible duplicates).")
-                        st.write(f"🔢 Tokens used: {in_tokens + out_tokens} (Prompt: {in_tokens}, Response: {out_tokens})")
-                        st.write(f"🔁 Total session tokens: {st.session_state.total_tokens}")
-                    except json.JSONDecodeError:
-                        st.error("❌ Failed to parse extraction result. Data not stored.")
-                else:
-                    st.error("❌ Data extraction failed.")
-
-with tab2:
-    st.markdown("### 🔍 View Stored Records")
-    ids = fetch_ids(connection, cursor)
+# API Endpoints
+@app.post("/upload")
+async def upload_files(files: list[UploadFile] = File(...)):
+    connection, cursor = init_db()
+    if not connection or not cursor:
+        raise HTTPException(status_code=500, detail="Database connection failed")
     
-    # Define table headers
-    headers = ["Name", "Email", "Number", "Professional Summary", "Project Name", "Skills"]
-    
-    # Initialize table data if not set
-    if st.session_state.table_data is None:
-        st.session_state.table_data = pd.DataFrame([["N/A"] * len(headers)], columns=headers)
-    
-    # Create a placeholder for the table
-    table_placeholder = st.empty()
-    
-    # Display the table in the placeholder
-    table_placeholder.table(st.session_state.table_data)
-    
-    if ids:
-        selected_id = st.selectbox("Select Record ID:", ["Select an ID"] + ids)
-        if st.button("View Record"):
-            if selected_id == "Select an ID":
-                st.error("❌ Please select a valid record ID.")
-                # Reset table to headers with N/A values
-                st.session_state.table_data = pd.DataFrame([["N/A"] * len(headers)], columns=headers)
+    results = []
+    total_tokens = 0
+    try:
+        for file in files:
+            content = read_file(file)
+            intent = detect_email_intent(content)
+            result, in_tokens, out_tokens = extract_data_with_gemini(content)
+            total_tokens += in_tokens + out_tokens
+            if result:
+                inserted = store_data_in_db(result, connection, cursor)
+                results.append({
+                    "filename": file.filename,
+                    "intent": intent,
+                    "extracted_data": json.loads(result) if result else None,
+                    "tokens_used": in_tokens + out_tokens,
+                    "stored": inserted
+                })
             else:
-                record = fetch_record_by_id(selected_id, connection, cursor)
-                if record:
-                    # Update the same table with the new record values
-                    st.session_state.table_data = pd.DataFrame([record], columns=headers)
-                else:
-                    st.error("❌ Record not found.")
-                    # Reset table to headers with N/A values
-                    st.session_state.table_data = pd.DataFrame([["N/A"] * len(headers)], columns=headers)
-            
-            # Update the table in the placeholder
-            table_placeholder.table(st.session_state.table_data)
-    else:
-        st.info("ℹ No records found in the database.")
+                results.append({
+                    "filename": file.filename,
+                    "intent": intent,
+                    "extracted_data": None,
+                    "tokens_used": in_tokens,
+                    "stored": False
+                })
+        return {"results": results, "total_tokens": total_tokens}
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
 
-# Close database connection
-if connection and connection.is_connected():
-    cursor.close()
-    connection.close()
+@app.get("/records")
+async def get_records():
+    connection, cursor = init_db()
+    if not connection or not cursor:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        ids = fetch_ids(connection, cursor)
+        return {"ids": ids}
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+
+@app.get("/record/{record_id}")
+async def get_record(record_id: str):
+    connection, cursor = init_db()
+    if not connection or not cursor:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        record = fetch_record_by_id(record_id, connection, cursor)
+        if not record:
+            raise HTTPException(status_code=404, detail="Record not found")
+        return record
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
+
+@app.get("/all_records")
+async def get_all_records():
+    connection, cursor = init_db()
+    if not connection or not cursor:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    try:
+        records = fetch_all_records(connection, cursor)
+        return {"records": records}
+    finally:
+        if connection.is_connected():
+            cursor.close()
+            connection.close()
